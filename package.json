@@ -1,0 +1,10 @@
+{
+    "urls": [
+        [
+            "bq27220.py",
+            "github:HowManyOliversAreThere/micropython-bq27220/bq27220.py"
+        ]
+    ],
+    "deps": [],
+    "version": "1.0"
+}
