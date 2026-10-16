@@ -6,10 +6,12 @@ I2C address (7-bit): 0x55 (fixed). Up to 400 kHz.
 
 This covers the gauge's standard commands - state of charge, voltage,
 current, capacity, time-to-empty/full, temperature, status flags - and
-reading the device number. It doesn't change the gauge's data memory
-(design capacity, CEDV profile and so on). The gauge ships with generic
-defaults, so for accurate state-of-charge figures configure it for your
-cell with TI's tools (or the CONFIG UPDATE procedure in the TRM).
+reading the device number - and writing the gauge's data memory, such
+as the cell's capacity (set_capacity()). The data memory is RAM: it goes
+back to the factory defaults (3000 mAh) whenever the gauge loses power,
+so set it on every start-up - set_capacity() only writes when it differs.
+The rest of the CEDV profile stays at TI's generic values; for the best
+accuracy, characterise your cell with TI's tools.
 
 Quick start
 -----------
@@ -20,6 +22,7 @@ Quick start
     gauge = bq27220.BQ27220(i2c)
     print(gauge.state_of_charge(), "%", gauge.voltage(), "mV", gauge.current(), "mA")
     print(gauge.charging, gauge.time_to_empty())
+    gauge.set_capacity(1000)  # a 1000 mAh cell
 """
 
 import time
@@ -47,9 +50,27 @@ _CMD_STATE_OF_HEALTH = const(0x2E)  # %
 _CMD_OPERATION_STATUS = const(0x3A)
 _CMD_DESIGN_CAPACITY = const(0x3C)  # mAh
 _CMD_MAC = const(0x3E)  # ManufacturerAccessControl
+_CMD_MAC_DATA = const(0x40)
+_CMD_MAC_DATA_SUM = const(0x60)  # then MACDataLen() at 0x61
 
 _SUB_DEVICE_NUMBER = const(0x0001)
 _SUB_FW_VERSION = const(0x0002)
+_SUB_SEALED = const(0x0030)
+_SUB_ENTER_CFG_UPDATE = const(0x0090)
+_SUB_EXIT_CFG_UPDATE_REINIT = const(0x0091)
+UNSEAL_KEYS = (0x0414, 0x3672)  # TI's defaults
+
+# OperationStatus() bits.
+OP_SEC_SHIFT = const(1)  # 2 bits: SEC_*
+OP_INITCOMP = const(0x0020)
+OP_CFGUPDATE = const(0x0400)
+SEC_FULL = const(1)
+SEC_UNSEALED = const(2)
+SEC_SEALED = const(3)
+
+# Data memory addresses (values are big-endian).
+DM_FULL_CHARGE_CAPACITY = const(0x929D)  # mAh, CEDV profile 1
+DM_DESIGN_CAPACITY = const(0x929F)  # mAh, CEDV profile 1
 
 # BatteryStatus() bits.
 STATUS_DSG = 0x0001  # discharging (clear while charging or relaxed)
@@ -110,6 +131,78 @@ class BQ27220:
     def firmware_version(self):
         """Raw FW_VERSION bytes, as described in the TRM."""
         return bytes(self._subcommand(_SUB_FW_VERSION, 8))
+
+    # ---- Configuration (data memory) ----------------------------------------
+    def _control(self, sub):
+        self._i2c.writeto_mem(self._addr, _CMD_CONTROL, bytes((sub & 0xFF, sub >> 8)))
+
+    def security(self):
+        """SEC_SEALED, SEC_UNSEALED or SEC_FULL."""
+        return (self.operation_status() >> OP_SEC_SHIFT) & 3
+
+    def unseal(self, keys=UNSEAL_KEYS):
+        """Allow data memory access. Raises OSError if the keys don't work."""
+        if self.security() != SEC_SEALED:
+            return
+        for key in keys:
+            self._control(key)
+            time.sleep_ms(5)
+        if self.security() == SEC_SEALED:
+            raise OSError("BQ27220 didn't unseal")
+
+    def seal(self):
+        self._control(_SUB_SEALED)
+        time.sleep_ms(5)
+
+    def _wait_status(self, bit, set_, timeout_ms):
+        deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
+        while bool(self.operation_status() & bit) != set_:
+            if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+                raise OSError("BQ27220 timed out waiting for status 0x%04X" % bit)
+            time.sleep_ms(10)
+
+    def read_data_memory(self, address, size):
+        """`size` bytes of data memory at `address` (needs unsealing)."""
+        self._i2c.writeto_mem(self._addr, _CMD_MAC, bytes((address & 0xFF, address >> 8)))
+        time.sleep_ms(2)
+        return self._i2c.readfrom_mem(self._addr, _CMD_MAC_DATA, size)
+
+    def write_data_memory(self, values):
+        """Write data memory in one CONFIG UPDATE: `values` is a list of
+        (address, bytes) - multi-byte values big-endian. Unseals first if
+        needed (and seals again after). Takes about 2 seconds."""
+        was_sealed = self.security() == SEC_SEALED
+        self.unseal()
+        self._i2c.writeto_mem(self._addr, _CMD_MAC, bytes((_SUB_ENTER_CFG_UPDATE & 0xFF, _SUB_ENTER_CFG_UPDATE >> 8)))
+        self._wait_status(OP_CFGUPDATE, True, 2000)
+        try:
+            for address, data in values:
+                block = bytes((address & 0xFF, address >> 8)) + bytes(data)
+                self._i2c.writeto_mem(self._addr, _CMD_MAC, block)
+                time.sleep_ms(1)
+                checksum = 0xFF - (sum(block) & 0xFF)
+                # Checksum, then the length of address + data + checksum + length.
+                self._i2c.writeto_mem(self._addr, _CMD_MAC_DATA_SUM, bytes((checksum, len(block) + 2)))
+                time.sleep_ms(10)
+        finally:
+            self._control(_SUB_EXIT_CFG_UPDATE_REINIT)
+            time.sleep_ms(1000)
+            self._wait_status(OP_CFGUPDATE, False, 3000)
+            if was_sealed:
+                self.seal()
+
+    def set_capacity(self, mah):
+        """Configure the gauge for a `mah` cell: design capacity, and the
+        starting full-charge capacity (the gauge learns the real one over
+        charge cycles). Does nothing if it's already set. Returns True if
+        it wrote."""
+        if self.design_capacity() == mah:
+            return False
+        v = bytes((mah >> 8, mah & 0xFF))
+        self.write_data_memory([(DM_DESIGN_CAPACITY, v), (DM_FULL_CHARGE_CAPACITY, v)])
+        if self.design_capacity() != mah:
+            raise OSError("BQ27220 capacity didn't take (reads %d mAh)" % self.design_capacity())
+        return True
 
     # ---- Battery state ----------------------------------------------------
     def state_of_charge(self):
